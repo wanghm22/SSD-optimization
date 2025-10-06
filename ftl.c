@@ -7,17 +7,13 @@
 
 #define MAX_MAPPING_ENTRIES (64 * 1000 * 1000)
 
-
 static uint64_t memoryUsed = 0;
 static uint64_t memoryMax = 0;
 
 typedef struct {
-    uint64_t ppn[128];
-} Block;
-
-typedef struct {
-    Block **items;       // 存储Block指针的数组
-    int size;           // 当前元素数量
+    uint64_t *items;       // 存储uint64_t值的数组
+    int size;              // 当前元素数量
+    int capacity;          // 当前容量
 } vector;
 
 // 初始化vector
@@ -26,89 +22,90 @@ vector* vector_init() {
     if (!v) return NULL;
     
     v->size = 0;
-    v->items = NULL;  // 初始化为空
+    v->capacity = 0;
+    v->items = NULL;
     
     memoryUsed += sizeof(vector);
+    if (memoryUsed > memoryMax) memoryMax = memoryUsed;
     
     return v;
 }
-
-
 
 // 释放vector
 void vector_free(vector *v) {
     if (v == NULL) return;
     
-    // 释放所有Block元素
-    for (int i = 0; i < v->size; i++) {
-        if (v->items[i] != NULL) {
-            free(v->items[i]);
-            memoryUsed -= sizeof(Block);
-        }
-    }
-    
     // 释放items数组
     if (v->items != NULL) {
-        memoryUsed -= sizeof(Block*) * v->size;
+        memoryUsed -= sizeof(uint64_t) * v->capacity;
         free(v->items);
     }
     
     memoryUsed -= sizeof(vector);
     free(v);
+    
+    if (memoryUsed > memoryMax) memoryMax = memoryUsed;
+}
+
+// 确保有足够容量
+static bool vector_ensure_capacity(vector *v, int min_capacity) {
+    if (min_capacity <= v->capacity) return true;
+    
+    // 按2的幂次增长，避免频繁realloc
+    int new_capacity = v->capacity == 0 ? 16 : v->capacity * 2;
+    if (new_capacity < min_capacity) new_capacity = min_capacity;
+    
+    uint64_t *new_items = (uint64_t*)realloc(v->items, sizeof(uint64_t) * new_capacity);
+    if (!new_items) return false;
+    
+    // 初始化新分配的内存为0
+    if (new_capacity > v->capacity) {
+        memset(new_items + v->size, 0, sizeof(uint64_t) * (new_capacity - v->size));
+    }
+    
+    memoryUsed += sizeof(uint64_t) * (new_capacity - v->capacity);
+    v->items = new_items;
+    v->capacity = new_capacity;
+    
+    if (memoryUsed > memoryMax) memoryMax = memoryUsed;
+    
+    return true;
 }
 
 // 在末尾添加元素
-bool vector_push_back(vector *v, Block *element) {
-    // 重新分配items数组，增加一个位置
-    Block **new_items = (Block**)realloc(v->items, sizeof(Block*) * (v->size + 1));
-    if (!new_items) return false;
-    
-    // 更新内存使用统计
-    if (v->items == NULL) {
-        memoryUsed += sizeof(Block*) * (v->size + 1);
-    } else {
-        memoryUsed += sizeof(Block*);  // 每次只增加一个指针的大小
-    }
-    
-    v->items = new_items;
-    
-    // 分配新Block的内存
-    v->items[v->size] = (Block*)malloc(sizeof(Block));
-    if (!v->items[v->size]) {
+bool vector_push_back(vector *v, uint64_t element) {
+    if (!vector_ensure_capacity(v, v->size + 1)) {
         return false;
     }
     
-    memoryUsed += sizeof(Block);
-    
-    // 拷贝数据
-    memcpy(v->items[v->size], element, sizeof(Block));
+    v->items[v->size] = element;
     v->size++;
     
     return true;
 }
 
 // 获取指定位置的元素（带边界检查）
-Block* vector_at(vector *v, int index) {
+uint64_t vector_at(vector *v, int index) {
     if (index < 0 || index >= v->size) {
-        return NULL;
+        return 0;  // 返回0而不是NULL，因为这是uint64_t
     }
     return v->items[index];
 }
 
-// 设置指定位置的元素（如果不存在则创建）
-bool vector_set(vector *v, int index, Block *element) {
+// 设置指定位置的元素（如果不存在则扩展）
+bool vector_set(vector *v, int index, uint64_t element) {
     if (index < 0) return false;
     
     // 如果索引超出当前大小，需要扩展vector
-    while (index >= v->size) {
-        Block empty_block = {0};  // 初始化为全0
-        if (!vector_push_back(v, &empty_block)) {
+    if (index >= v->size) {
+        if (!vector_ensure_capacity(v, index + 1)) {
             return false;
         }
+        v->size = index + 1;
     }
     
-    // 拷贝数据到现有位置
-    memcpy(v->items[index], element, sizeof(Block));
+    // 直接设置值
+    v->items[index] = element;
     return true;
 }
 
@@ -129,19 +126,12 @@ void FTLDestroy() {
  * @return uint64_t       返回物理地址
  */
 uint64_t FTLRead(uint64_t lba) {   
-    uint64_t theidx = lba / 128;
-    
-    if (theidx >= (uint64_t)ftl->size) {
-        // 读取未分配的块，返回0或错误值
+    if (lba >= (uint64_t)ftl->size) {
+        // 读取未分配的块，返回0
         return 0;
     }
     
-    Block *block = vector_at(ftl, theidx);
-    if (!block) {
-        return 0;
-    }
-    
-    return block->ppn[lba % 128];
+    return vector_at(ftl, lba);
 }
 
 /**
@@ -151,29 +141,7 @@ uint64_t FTLRead(uint64_t lba) {
  * @return bool           返回
  */
 bool FTLModify(uint64_t lba, uint64_t ppn) {    
-    uint64_t theidx = lba / 128;
-    uint32_t offset = lba % 128;
-    
-    Block *block = NULL;
-    
-    if (theidx < (uint64_t)ftl->size) {
-        // 块已存在
-        block = vector_at(ftl, theidx);
-    } else {
-        // 需要创建新块
-        Block new_block = {0};  // 初始化为全0
-        if (!vector_set(ftl, theidx, &new_block)) {
-            return false;
-        }
-        block = vector_at(ftl, theidx);
-    }
-    
-    if (!block) {
-        return false;
-    }
-    
-    block->ppn[offset] = ppn;
-    return true;
+    return vector_set(ftl, lba, ppn);
 }
 
 uint32_t AlgorithmRun(IOVector *ioVector, const char *outputFile) {
@@ -199,7 +167,6 @@ uint32_t AlgorithmRun(IOVector *ioVector, const char *outputFile) {
         } else {
             FTLModify(ioVector->ioArray[i].lba, ioVector->ioArray[i].ppn);
         }
-        memoryMax = MAX(memoryMax, memoryUsed);
     }
 
     // 记录结束时间
@@ -214,7 +181,7 @@ uint32_t AlgorithmRun(IOVector *ioVector, const char *outputFile) {
     useconds = end.tv_usec - start.tv_usec;
 
     // 总微秒数
-    during = ((seconds) * 1000000 + useconds);
+    during = ((seconds) * 1000000 + useconds) ;  // 转换为毫秒
     printf("algorithmRunningDuration:\t %f ms\n", during);
     printf("Max memory used:\t\t %llu B\n", memoryMax);
 
