@@ -6,41 +6,254 @@
 #include "ftl.h"
 
 #define MAX_MAPPING_ENTRIES (64 * 1000 * 1000)
-#define INITIAL_CAPACITY 1024
 
 static uint64_t memoryUsed = 0;
 static uint64_t memoryMax = 0;
 
+typedef enum { RED, BLACK } Color;
+
+// 键值对结构
+typedef struct KeyValue {
+    int key;
+    uint64_t value;
+} KeyValue;
+
+// 红黑树节点
+typedef struct Node {
+    KeyValue data;
+    Color color;
+    struct Node* left;
+    struct Node* right;
+    struct Node* parent;
+} Node;
+
+// Map 结构
 typedef struct {
-   uint64_t idx;
-   uint64_t ppn;
-} map_entry;
+    Node* root;
+    Node* nil;  // 哨兵节点
+    int size;
+} TreeMap;
 
-typedef struct {
-    map_entry *data;        // 改为连续内存数组
-    uint64_t size;
-    uint64_t capacity;
-} FTL;
+// 创建哨兵节点
+Node* create_nil_node() {
+    Node* nil = (Node*)malloc(sizeof(Node));
+    nil->color = BLACK;
+    nil->left = nil->right = nil->parent = NULL;
+    memoryUsed += sizeof(Node);
+    return nil;
+}
 
-static FTL *ftl = NULL;
+// 创建新节点
+Node* create_node(int key, uint64_t value) {
+    Node* new_node = (Node*)malloc(sizeof(Node));
+    new_node->data.key = key;
+    new_node->data.value = value;
+    new_node->color = RED;
+    new_node->left = new_node->right = new_node->parent = NULL;
+    memoryUsed += sizeof(Node);
+    return new_node;
+}
 
-void FTLInit() {
-    ftl = malloc(sizeof(FTL));
-    memoryUsed += sizeof(FTL);
+// 创建 Map
+TreeMap* create_tree_map() {
+    TreeMap* map = (TreeMap*)malloc(sizeof(TreeMap));
+    memoryUsed += sizeof(TreeMap);
+    map->nil = create_nil_node();
+    map->root = map->nil;
+    map->size = 0;
+    return map;
+}
+
+// 左旋
+void left_rotate(TreeMap* map, Node* x) {
+    Node* y = x->right;
+    x->right = y->left;
     
-    ftl->capacity = INITIAL_CAPACITY;
-    ftl->data = calloc(ftl->capacity, sizeof(map_entry));  // 使用calloc初始化为0
-    memoryUsed += ftl->capacity * sizeof(map_entry);
+    if (y->left != map->nil) {
+        y->left->parent = x;
+    }
     
-    ftl->size = 0;
+    y->parent = x->parent;
+    
+    if (x->parent == map->nil) {
+        map->root = y;
+    } else if (x == x->parent->left) {
+        x->parent->left = y;
+    } else {
+        x->parent->right = y;
+    }
+    
+    y->left = x;
+    x->parent = y;
+}
+
+// 右旋
+void right_rotate(TreeMap* map, Node* y) {
+    Node* x = y->left;
+    y->left = x->right;
+    
+    if (x->right != map->nil) {
+        x->right->parent = y;
+    }
+    
+    x->parent = y->parent;
+    
+    if (y->parent == map->nil) {
+        map->root = x;
+    } else if (y == y->parent->left) {
+        y->parent->left = x;
+    } else {
+        y->parent->right = x;
+    }
+    
+    x->right = y;
+    y->parent = x;
+}
+
+// 插入修复
+void insert_fixup(TreeMap* map, Node* z) {
+    while (z->parent->color == RED) {
+        if (z->parent == z->parent->parent->left) {
+            Node* y = z->parent->parent->right;
+            if (y->color == RED) {
+                // Case 1
+                z->parent->color = BLACK;
+                y->color = BLACK;
+                z->parent->parent->color = RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->right) {
+                    // Case 2
+                    z = z->parent;
+                    left_rotate(map, z);
+                }
+                // Case 3
+                z->parent->color = BLACK;
+                z->parent->parent->color = RED;
+                right_rotate(map, z->parent->parent);
+            }
+        } else {
+            // 对称情况
+            Node* y = z->parent->parent->left;
+            if (y->color == RED) {
+                z->parent->color = BLACK;
+                y->color = BLACK;
+                z->parent->parent->color = RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->left) {
+                    z = z->parent;
+                    right_rotate(map, z);
+                }
+                z->parent->color = BLACK;
+                z->parent->parent->color = RED;
+                left_rotate(map, z->parent->parent);
+            }
+        }
+    }
+    map->root->color = BLACK;
+}
+
+// 插入键值对
+void tree_map_put(TreeMap* map, int key, uint64_t value) {
+    Node* z = create_node(key, value);
+    Node* y = map->nil;
+    Node* x = map->root;
+    
+    // 找到插入位置
+    while (x != map->nil) {
+        y = x;
+        if (z->data.key < x->data.key) {
+            x = x->left;
+        } else if (z->data.key > x->data.key) {
+            x = x->right;
+        } else {
+            // 键已存在，更新值
+            x->data.value = value;
+            free(z);
+            memoryUsed -= sizeof(Node); // 释放未使用的节点
+            return;
+        }
+    }
+    
+    z->parent = y;
+    if (y == map->nil) {
+        map->root = z;
+    } else if (z->data.key < y->data.key) {
+        y->left = z;
+    } else {
+        y->right = z;
+    }
+    
+    z->left = map->nil;
+    z->right = map->nil;
+    z->color = RED;
+    
+    insert_fixup(map, z);
+    map->size++;
+}
+
+// 查找节点
+Node* tree_map_get_node(TreeMap* map, int key) {
+    Node* current = map->root;
+    while (current != map->nil) {
+        if (key == current->data.key) {
+            return current;
+        } else if (key < current->data.key) {
+            current = current->left;
+        } else {
+            current = current->right;
+        }
+    }
+    return NULL;  // 未找到
+}
+
+// 查找值
+int tree_map_get(TreeMap* map, int key, uint64_t* value) {
+    Node* node = tree_map_get_node(map, key);
+    if (node) {
+        *value = node->data.value;
+        return 1;
+    }
+    return 0;
+}
+
+// 判断键是否存在
+int tree_map_contains(TreeMap* map, int key) {
+    return tree_map_get_node(map, key) != NULL;
+}
+
+// 清空树
+void clear_tree(Node* node, Node* nil) {
+    if (node != nil) {
+        clear_tree(node->left, nil);
+        clear_tree(node->right, nil);
+        free(node);
+        memoryUsed -= sizeof(Node);
+    }
+}
+
+// 销毁 Map
+void free_tree_map(TreeMap* map) {
+    clear_tree(map->root, map->nil);
+    free(map->nil);
+    memoryUsed -= sizeof(Node); // nil 节点的内存
+    free(map);
+    memoryUsed -= sizeof(TreeMap);
+}
+
+static TreeMap *ftl = NULL;
+
+void FTLInit(){
+    ftl = create_tree_map();
+    // 重置内存统计（如果需要）
+    // memoryUsed = 0;
+    // memoryMax = 0;
 }
 
 void FTLDestroy() {
     if (ftl) {
-        if (ftl->data) {
-            free(ftl->data);
-        }
-        free(ftl);
+        free_tree_map(ftl);
         ftl = NULL;
     }
 }
@@ -51,19 +264,11 @@ void FTLDestroy() {
  * @return uint64_t       返回物理地址
  */
 uint64_t FTLRead(uint64_t lba) {
-    // 如果lba在数组范围内且该位置有有效数据，直接返回
-    if (lba < ftl->size && ftl->data[lba].idx == lba) {
-        return ftl->data[lba].ppn;
+    uint64_t value = 0;
+    if (ftl && tree_map_get(ftl, (int)lba, &value)) {
+        return value;
     }
-    
-    // 线性搜索（这种情况应该很少发生）
-    for (uint64_t i = 0; i < ftl->size; i++) {
-        if (ftl->data[i].idx == lba) {
-            return ftl->data[i].ppn;
-        }
-    }
-    
-    return 0;  // 未找到映射
+    return 0;  // 没有找到
 }
 
 /**
@@ -73,42 +278,8 @@ uint64_t FTLRead(uint64_t lba) {
  * @return bool           返回
  */
 bool FTLModify(uint64_t lba, uint64_t ppn) {
-    // 如果lba在现有范围内，直接更新
-    if (lba < ftl->size) {
-        ftl->data[lba].ppn = ppn;
-        ftl->data[lba].idx = lba;  // 确保idx正确设置
-        return true;
-    }
-    
-    // 需要扩展数组
-    if (lba >= ftl->capacity) {
-        uint64_t new_capacity = ftl->capacity * 2;
-        while (new_capacity <= lba) {
-            new_capacity *= 2;
-        }
-        
-        map_entry *new_data = realloc(ftl->data, new_capacity * sizeof(map_entry));
-        if (!new_data) {
-            return false;
-        }
-        
-        // 初始化新分配的内存
-        memset(new_data + ftl->capacity, 0, (new_capacity - ftl->capacity) * sizeof(map_entry));
-        
-        memoryUsed += (new_capacity - ftl->capacity) * sizeof(map_entry);
-        ftl->data = new_data;
-        ftl->capacity = new_capacity;
-    }
-    
-    // 设置新条目
-    ftl->data[lba].idx = lba;
-    ftl->data[lba].ppn = ppn;
-    
-    // 更新size
-    if (lba >= ftl->size) {
-        ftl->size = lba + 1;
-    }
-    
+    if (!ftl) return false;
+    tree_map_put(ftl, (int)lba, ppn);
     return true;
 }
 
@@ -123,7 +294,12 @@ uint32_t AlgorithmRun(IOVector *ioVector, const char *outputFile) {
         exit(EXIT_FAILURE);
     }
 
+    // 初始化 FTL
     FTLInit();
+    
+    // 重置内存统计
+    memoryUsed = 0;
+    memoryMax = 0;
 
     // 记录开始时间
     gettimeofday(&start, NULL);
