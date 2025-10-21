@@ -12,7 +12,7 @@ extern "C" {
 void FTLInit();
 void FTLDestroy();
 uint64_t FTLRead(uint64_t lba);
-bool FTLModify(uint64_t lba, uint64_t ppn);
+bool FTLModify(uint64_t lba);
 uint32_t AlgorithmRun(IOVector *ioVector, const char *filename);
 
 

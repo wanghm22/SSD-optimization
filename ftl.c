@@ -2,284 +2,167 @@
 #include <string.h>
 #include <sys/time.h>
 #include <stdbool.h>
-
+#include <stdint.h>
 #include "ftl.h"
 
+#ifdef __GNUC__
+__fp16 half_float;
+#endif
 #define MAX_MAPPING_ENTRIES (64 * 1000 * 1000)
+#define NUMBER_OF_SECTORS 250000
 
 static uint64_t memoryUsed = 0;
 static uint64_t memoryMax = 0;
 
-typedef enum { RED, BLACK } Color;
-
-// 键值对结构
-typedef struct KeyValue {
-    int key;
-    uint64_t value;
-} KeyValue;
-
-// 红黑树节点
-typedef struct Node {
-    KeyValue data;
-    Color color;
-    struct Node* left;
-    struct Node* right;
-    struct Node* parent;
-} Node;
-
-// Map 结构
-typedef struct {
-    Node* root;
-    Node* nil;  // 哨兵节点
-    int size;
-} TreeMap;
-
-// 创建哨兵节点
-Node* create_nil_node() {
-    Node* nil = (Node*)malloc(sizeof(Node));
-    nil->color = BLACK;
-    nil->left = nil->right = nil->parent = NULL;
-    memoryUsed += sizeof(Node);
-    return nil;
-}
-
-// 创建新节点
-Node* create_node(int key, uint64_t value) {
-    Node* new_node = (Node*)malloc(sizeof(Node));
-    new_node->data.key = key;
-    new_node->data.value = value;
-    new_node->color = RED;
-    new_node->left = new_node->right = new_node->parent = NULL;
-    memoryUsed += sizeof(Node);
-    return new_node;
-}
-
-// 创建 Map
-TreeMap* create_tree_map() {
-    TreeMap* map = (TreeMap*)malloc(sizeof(TreeMap));
-    memoryUsed += sizeof(TreeMap);
-    map->nil = create_nil_node();
-    map->root = map->nil;
-    map->size = 0;
-    return map;
-}
-
-// 左旋
-void left_rotate(TreeMap* map, Node* x) {
-    Node* y = x->right;
-    x->right = y->left;
-    
-    if (y->left != map->nil) {
-        y->left->parent = x;
-    }
-    
-    y->parent = x->parent;
-    
-    if (x->parent == map->nil) {
-        map->root = y;
-    } else if (x == x->parent->left) {
-        x->parent->left = y;
-    } else {
-        x->parent->right = y;
-    }
-    
-    y->left = x;
-    x->parent = y;
-}
-
-// 右旋
-void right_rotate(TreeMap* map, Node* y) {
-    Node* x = y->left;
-    y->left = x->right;
-    
-    if (x->right != map->nil) {
-        x->right->parent = y;
-    }
-    
-    x->parent = y->parent;
-    
-    if (y->parent == map->nil) {
-        map->root = x;
-    } else if (y == y->parent->left) {
-        y->parent->left = x;
-    } else {
-        y->parent->right = x;
-    }
-    
-    x->right = y;
-    y->parent = x;
-}
-
-// 插入修复
-void insert_fixup(TreeMap* map, Node* z) {
-    while (z->parent->color == RED) {
-        if (z->parent == z->parent->parent->left) {
-            Node* y = z->parent->parent->right;
-            if (y->color == RED) {
-                // Case 1
-                z->parent->color = BLACK;
-                y->color = BLACK;
-                z->parent->parent->color = RED;
-                z = z->parent->parent;
-            } else {
-                if (z == z->parent->right) {
-                    // Case 2
-                    z = z->parent;
-                    left_rotate(map, z);
-                }
-                // Case 3
-                z->parent->color = BLACK;
-                z->parent->parent->color = RED;
-                right_rotate(map, z->parent->parent);
-            }
-        } else {
-            // 对称情况
-            Node* y = z->parent->parent->left;
-            if (y->color == RED) {
-                z->parent->color = BLACK;
-                y->color = BLACK;
-                z->parent->parent->color = RED;
-                z = z->parent->parent;
-            } else {
-                if (z == z->parent->left) {
-                    z = z->parent;
-                    right_rotate(map, z);
-                }
-                z->parent->color = BLACK;
-                z->parent->parent->color = RED;
-                left_rotate(map, z->parent->parent);
-            }
-        }
-    }
-    map->root->color = BLACK;
-}
-
-// 插入键值对
-void tree_map_put(TreeMap* map, int key, uint64_t value) {
-    Node* z = create_node(key, value);
-    Node* y = map->nil;
-    Node* x = map->root;
-    
-    // 找到插入位置
-    while (x != map->nil) {
-        y = x;
-        if (z->data.key < x->data.key) {
-            x = x->left;
-        } else if (z->data.key > x->data.key) {
-            x = x->right;
-        } else {
-            // 键已存在，更新值
-            x->data.value = value;
-            free(z);
-            memoryUsed -= sizeof(Node); // 释放未使用的节点
-            return;
-        }
-    }
-    
-    z->parent = y;
-    if (y == map->nil) {
-        map->root = z;
-    } else if (z->data.key < y->data.key) {
-        y->left = z;
-    } else {
-        y->right = z;
-    }
-    
-    z->left = map->nil;
-    z->right = map->nil;
-    z->color = RED;
-    
-    insert_fixup(map, z);
-    map->size++;
-}
-
-// 查找节点
-Node* tree_map_get_node(TreeMap* map, int key) {
-    Node* current = map->root;
-    while (current != map->nil) {
-        if (key == current->data.key) {
-            return current;
-        } else if (key < current->data.key) {
-            current = current->left;
-        } else {
-            current = current->right;
-        }
-    }
-    return NULL;  // 未找到
-}
-
-// 查找值
-int tree_map_get(TreeMap* map, int key, uint64_t* value) {
-    Node* node = tree_map_get_node(map, key);
-    if (node) {
-        *value = node->data.value;
-        return 1;
-    }
-    return 0;
-}
-
-// 判断键是否存在
-int tree_map_contains(TreeMap* map, int key) {
-    return tree_map_get_node(map, key) != NULL;
-}
-
-// 清空树
-void clear_tree(Node* node, Node* nil) {
-    if (node != nil) {
-        clear_tree(node->left, nil);
-        clear_tree(node->right, nil);
-        free(node);
-        memoryUsed -= sizeof(Node);
-    }
-}
-
-// 销毁 Map
-void free_tree_map(TreeMap* map) {
-    clear_tree(map->root, map->nil);
-    free(map->nil);
-    memoryUsed -= sizeof(Node); // nil 节点的内存
-    free(map);
-    memoryUsed -= sizeof(TreeMap);
-}
-
-static TreeMap *ftl = NULL;
+typedef struct{
+    uint8_t start;
+    uint8_t length;
+    __fp16 k;
+    uint32_t b; 
+    bool accuracy;  
+}section;//学习段
+typedef struct{
+    section *sec;//本层学习段数组
+    uint8_t size;
+}levelsec;//某一层的所有学习段
+typedef struct{
+    levelsec *sec;
+    uint8_t size;
+}table;//一个组内（256lba为一组）全部层的学习段
+typedef struct{
+    uint8_t *data;
+    uint8_t size;
+}CRB;
+typedef struct{
+    table t[NUMBER_OF_SECTORS];
+    CRB crb[NUMBER_OF_SECTORS];
+}FTL;
+static FTL *ftl = NULL;
 
 void FTLInit(){
-    ftl = create_tree_map();
-    // 重置内存统计（如果需要）
-    // memoryUsed = 0;
-    // memoryMax = 0;
+    ftl = malloc(sizeof(FTL));
+    memoryUsed += sizeof(FTL);
 }
 
 void FTLDestroy() {
-    if (ftl) {
-        free_tree_map(ftl);
-        ftl = NULL;
-    }
+    free(ftl);
+    ftl = NULL;
 }
-
+void Insert(int idx,section sec,int level){
+    if(ftl->t[idx].size==level){
+        ftl->t[idx].sec=realloc(ftl->t[idx].sec,(level+1)*sizeof(levelsec));
+        ftl->t[idx].size+=1;
+        ftl->t[idx].sec[level].sec=malloc(sizeof(section));
+        ftl->t[idx].sec[level].size=0;
+    }
+    for(int i=0;i<ftl->t[idx].sec[level].size;++i){//此处有问题，考虑新来的区间与多个区间重叠的情况
+        if(!((ftl->t[idx].sec[level].sec[i].start>sec.start+sec.length)||(ftl->t[idx].sec[level].sec[i].start+ftl->t[idx].sec[level].sec[i].length<sec.start))){
+            Insert(idx,ftl->t[idx].sec[0].sec[i],level+1);
+            ftl->t[idx].sec[level].sec[i]=sec;
+            return;
+        }
+    }
+    ftl->t[idx].sec[level].sec=realloc(ftl->t[idx].sec[level].sec,(ftl->t[idx].sec[level].size+1)*sizeof(section));
+    ftl->t[idx].sec[level].sec[ftl->t[idx].sec[level].size++]=sec;
+    return;
+}
+uint8_t findincrd(int idx,int offset){
+  CRB crb=ftl->crb[idx];
+  offset=(uint8_t)offset;
+  int i=0;
+  int topidx=0;
+  while(i<crb.size){
+    if(crb.data[topidx]>offset){
+        return 0;
+    }
+    else{
+        for(int j=0;j<580;++j){
+            if(crb.data[topidx+j]==offset){return j;}
+            if(crb.data[topidx+j]==NULL){i+=1;topidx+=j+1;break;} 
+        }
+    }
+  }
+  return 0;
+}
 /**
  * @brief  获取 lba 对应的 ppn
  * @param  lba            逻辑地址
  * @return uint64_t       返回物理地址
  */
 uint64_t FTLRead(uint64_t lba) {
-    uint64_t value = 0;
-    if (ftl && tree_map_get(ftl, (int)lba, &value)) {
-        return value;
+    if(!ftl) return 0;
+    int idx=lba/256;
+    int offset=lba%256;
+    table *t=&ftl->t[idx];
+    CRB *crb=&ftl->crb[idx];//找到对应组
+    for(int i=0;i<t->size;++i){
+        for(int j=0;j<t->sec[i].size;++j){
+            if(offset>=t->sec[i].sec[j].start&&offset<=t->sec[i].sec[j].start+t->sec[i].sec[j].length){//在这一层找到对应区间
+                if(t->sec[i].sec[j].accuracy){//精确映射
+                    
+                    uint32_t b=t->sec[i].sec[j].b;
+                    __fp16 k=t->sec[i].sec[j].k;
+                    int step=(int)1/k;
+                    if((offset-t->sec[i].sec[j].start)%step==0){
+                        return b+(offset-t->sec[i].sec[j].start)/step*4096;
+                }
+                else{break;}
+            }
+            else{//近似映射
+                uint8_t theidx=findincrd(idx,offset);
+                if(theidx==0){break;}
+                return t->sec[i].sec[j].b+theidx*4096;
+            }
+        }
     }
-    return 0;  // 没有找到
 }
-
+return 0;
+}
 /**
  * @brief  记录 FTL 映射 lba->ppn
  * @param  lba            逻辑地址
  * @param  ppn            物理地址
  * @return bool           返回
  */
-bool FTLModify(uint64_t lba, uint64_t ppn) {
+bool FTLModify(uint64_t *lba, int size) {
     if (!ftl) return false;
-    tree_map_put(ftl, (int)lba, ppn);
+    int idx=lba[0]/256;
+    int d=0;
+    uint8_t start=0;
+    if(size>=2){d=lba[1]-lba[0];}
+    for(int i=1;i<size;++i){
+        if(lba[i]-lba[i-1]==d&&i<size-1){continue;}
+        else if(lba[i]-lba[i-1]!=d&&i<size-1){
+            section sec;
+            sec.start=start;
+            sec.length=(uint8_t)(lba[i-1]-start);
+            sec.k=(__fp16)1.0/(sec.length);
+            sec.accuracy=true;
+            sec.b=2000*idx;
+            Insert(idx,sec,0);
+            start=lba[i];
+        }
+        else if(i==size-1&&lba[i]-lba[i-1]==d){
+            section sec;
+            sec.start=start;
+            sec.length=(uint8_t)(lba[i]-start);
+            sec.k=(__fp16)1.0/(sec.length);
+            sec.accuracy=true;
+            sec.b=2000*idx;
+            Insert(idx,sec,0);
+            
+        }
+        else if(i==size-1&&lba[i]-lba[i-1]!=d){
+            section sec;
+            sec.start=start;
+            sec.length=(uint8_t)(lba[i-1]-start);
+            sec.k=(__fp16)1.0/(sec.length);
+            sec.accuracy=true;
+            sec.b=2000*idx;
+            Insert(idx,sec,0);
+            crbinsert(idx,lba[i]);//最后一个lba，不连续的情况
+        }
+    }
     return true;
 }
 
