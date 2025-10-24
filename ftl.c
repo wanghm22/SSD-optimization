@@ -29,7 +29,7 @@ typedef struct {
     uint8_t step;
     uint32_t b; 
     bool accuracy;  
-    bool valid;     // 新增：标记该section是否有效
+    // 移除了valid字段
 } section;
 
 typedef struct {
@@ -89,10 +89,15 @@ void sort_lba_array(uint64_t *lba_array, int size) {
     }
 }
 
+// 判断section是否有效
+bool is_section_valid(section *sec) {
+    return sec->start != INVALID_START;
+}
+
 // 重叠检测函数
 bool is_overlap(section *a, section *b) {
     // 如果任意一个section无效，则不重叠
-    if (!a->valid || !b->valid) {
+    if (!is_section_valid(a) || !is_section_valid(b)) {
         return false;
     }
     
@@ -112,9 +117,6 @@ bool is_overlap(section *a, section *b) {
 // 简化的Insert函数 - 使用无效化而不是内存重新分配
 void Insert(int idx, section new_sec, int start_level) {
     memoryUsed += sizeof(section);
-    if (!ftl || idx < 0 || idx >= NUMBER_OF_SECTORS) {
-        return;
-    }
     if (!ftl || idx < 0 || idx >= NUMBER_OF_SECTORS) {
         return;
     }
@@ -143,7 +145,7 @@ void Insert(int idx, section new_sec, int start_level) {
         // 在当前层查找冲突的section
         for (int i = 0; i < current_level_ptr->size; i++) {
             section *existing_sec = &current_level_ptr->sec[i];
-            if (existing_sec->start != 0xFF && is_overlap(existing_sec, &current_sec)) {
+            if (is_section_valid(existing_sec) && is_overlap(existing_sec, &current_sec)) {
                 conflict_sec = existing_sec;
                 conflict_index = i;
                 break;
@@ -155,7 +157,7 @@ void Insert(int idx, section new_sec, int start_level) {
             section temp_sec = *conflict_sec;
             
             // 无效化当前层的冲突section
-            conflict_sec->start = 0xFF;
+            conflict_sec->start = INVALID_START;
             
             // 插入当前section到当前层
             if (current_level_ptr->size >= current_level_ptr->capacity) {
@@ -209,7 +211,7 @@ uint64_t FTLRead(uint64_t lba) {
             section *sec = &lsec->sec[i];
             
             // 跳过无效的section
-            if (!sec->valid) {
+            if (!is_section_valid(sec)) {
                 continue;
             }
             
@@ -239,7 +241,7 @@ uint64_t FTLRead(uint64_t lba) {
     return 0; // 未找到映射
 }
 
-// ProcessWriteBuffer函数保持不变（但需要确保使用正确的组内偏移）
+// ProcessWriteBuffer函数
 void ProcessWriteBuffer() {
     if (!ftl || ftl->write_buffer.count == 0) return;
     
@@ -266,7 +268,7 @@ void ProcessWriteBuffer() {
             section sec;
             sec.start = ftl->write_buffer.lba[group_idx] % SECTORS_PER_GROUP;
             sec.b = current_ppn * FLASH_PAGE_SIZE;
-            sec.valid = true;  // 新插入的section都是有效的
+            // 不再设置valid字段
             
             // 检查是否是单个元素
             if (group_idx == group_end) {
@@ -342,16 +344,12 @@ bool FTLModify(uint64_t lba) {
 
 uint32_t AlgorithmRun(IOVector *ioVector, const char *filename) {
     if (!ioVector) {
-        // printf("[AlgorithmRun Error] ioVector is NULL\n");
         return RETURN_ERROR;
     }
     
     if (!ioVector->ioArray) {
-        // printf("[AlgorithmRun Error] ioArray is NULL\n");
         return RETURN_ERROR;
     }
-    
-    // printf("[AlgorithmRun] Starting with %lu IOs\n", ioVector->len);
     
     struct timeval start, end;
     FILE *file = filename ? fopen(filename, "w") : stdout;
@@ -374,16 +372,9 @@ uint32_t AlgorithmRun(IOVector *ioVector, const char *filename) {
         if (ioVector->ioArray[i].type == IO_READ) {
             uint64_t ret = FTLRead(ioVector->ioArray[i].lba);
             fprintf(file, "%llu\n", (unsigned long long)ret);
-            if (i % 1000 == 0) {
-                // printf("[AlgorithmRun] Processed %lu read operations\n", i);
-            }
-            
         } else {
             if (!FTLModify(ioVector->ioArray[i].lba)) {
                 printf("[AlgorithmRun Error] Failed to modify LBA: %lu\n", ioVector->ioArray[i].lba);
-            }
-            if (i % 1000 == 0) {
-                // printf("[AlgorithmRun] Processed %lu write operations\n", i);
             }
         }
         
@@ -393,7 +384,6 @@ uint32_t AlgorithmRun(IOVector *ioVector, const char *filename) {
     }
     
     // 处理缓冲区中剩余的数据
-    // printf("[AlgorithmRun] Processing remaining buffer data...\n");
     ProcessWriteBuffer();
 
     // 记录结束时间
