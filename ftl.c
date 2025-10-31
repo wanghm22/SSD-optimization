@@ -11,8 +11,7 @@
 #define SECTORS_PER_GROUP 256
 #define FLASH_PAGE_SIZE 4096
 #define WRITE_BUFFER_SIZE 256
-#define tolerance 2
-#define INVALID_START 0xFF
+#define INVALID_START 0xFF  // 使用0xFF表示无效（uint8_t的最大值）
 
 static uint64_t memoryUsed = 0;
 static uint64_t memoryMax = 0;
@@ -25,17 +24,12 @@ typedef struct {
 } WriteBuffer;
 
 typedef struct {
-    uint8_t *data;          // 扁平数组存储所有LBA，用CRB_SEPARATOR分隔段
-    int size;               // data数组当前大小
-    int segment_count;      // 段的数量
-} CRB;
-
-typedef struct {
     uint8_t start;
     uint8_t length;
     uint8_t step;
-    uint32_t b;
-    bool accuracy; // 表示是否是精确段
+    uint32_t b; 
+    bool accuracy;  
+    // 移除了valid字段
 } section;
 
 typedef struct {
@@ -47,7 +41,6 @@ typedef struct {
 typedef struct {
     levelsec *levels;
     uint8_t level_count;
-    CRB crb;
 } table;
 
 typedef struct {
@@ -57,213 +50,14 @@ typedef struct {
 
 static FTL *ftl = NULL;
 
-// 定义分隔符
-#define CRB_SEPARATOR 0xFF
-
-// 初始化CRB
-void init_crb(CRB *crb) {
-    crb->data = NULL;
-    crb->size = 0;
-    crb->segment_count = 0;
-}
-
-// 释放CRB内存
-void free_crb(CRB *crb) {
-    if (crb->data) {
-        free(crb->data);
-        crb->data = NULL;
-    }
-    crb->size = 0;
-    crb->segment_count = 0;
-}
-
-// 在CRB中查找指定LBA对应的段索引和在段中的位置
-bool crb_search(CRB *crb, uint8_t lba_offset, int *segment_index, int *position_in_segment) {
-    if (!crb || !crb->data || crb->size == 0) {
-        return false;
-    }
-    
-    int current_segment = 0;
-    int segment_start_index = 0;
-    
-    for (int i = 0; i < crb->size; i++) {
-        if (crb->data[i] == CRB_SEPARATOR) {
-            current_segment++;
-            segment_start_index = i + 1;
-            continue;
-        }
-        
-        if (crb->data[i] == lba_offset) {
-            *segment_index = current_segment;
-            *position_in_segment = i - segment_start_index;
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-// 计算段的数量
-int count_segments(CRB *crb) {
-    if (!crb || !crb->data || crb->size == 0) {
-        return 0;
-    }
-    
-    int count = 1;
-    for (int i = 0; i < crb->size; i++) {
-        if (crb->data[i] == CRB_SEPARATOR) {
-            count++;
-        }
-    }
-    return count;
-}
-
-// CRB插入函数
-void crbinsert(int group, int *lba_offsets, int size) {
-    if (!ftl || group < 0 || group >= NUMBER_OF_SECTORS || !lba_offsets || size <= 0) {
-        return;
-    }
-    
-    CRB *crb = &ftl->t[group].crb;
-    
-    // 对输入的LBA偏移量进行排序和去重
-    uint8_t *sorted_lbas = malloc(size * sizeof(uint8_t));
-    int sorted_size = 0;
-    
-    for (int i = 0; i < size; i++) {
-        uint8_t current = (uint8_t)lba_offsets[i];
-        int pos = 0;
-        while (pos < sorted_size && sorted_lbas[pos] < current) {
-            pos++;
-        }
-        
-        if (pos < sorted_size && sorted_lbas[pos] == current) {
-            continue;
-        }
-        
-        for (int j = sorted_size; j > pos; j--) {
-            sorted_lbas[j] = sorted_lbas[j - 1];
-        }
-        sorted_lbas[pos] = current;
-        sorted_size++;
-    }
-    
-    if (sorted_size == 0) {
-        free(sorted_lbas);
-        return;
-    }
-    
-    // 如果data为NULL，直接初始化
-    if (crb->data == NULL) {
-        crb->data = malloc(sorted_size * sizeof(uint8_t));
-        if (!crb->data) {
-            free(sorted_lbas);
-            return;
-        }
-        memcpy(crb->data, sorted_lbas, sorted_size * sizeof(uint8_t));
-        crb->size = sorted_size;
-        crb->segment_count = 1;
-        memoryUsed += sorted_size * sizeof(uint8_t);
-        free(sorted_lbas);
-        return;
-    }
-    
-    int current_segment_count = count_segments(crb);
-    int needs_separator = (crb->size > 0) ? 1 : 0;
-    int new_total_size = crb->size + sorted_size + needs_separator;
-    
-    uint8_t *new_data = realloc(crb->data, new_total_size * sizeof(uint8_t));
-    if (!new_data) {
-        free(sorted_lbas);
-        return;
-    }
-    crb->data = new_data;
-    
-    if (current_segment_count == 0) {
-        for (int i = 0; i < sorted_size; i++) {
-            crb->data[i] = sorted_lbas[i];
-        }
-        crb->size = sorted_size;
-    } else {
-        int insert_position = crb->size;
-        
-        // 查找插入位置
-        for (int i = 0; i < crb->size; i++) {
-            if (crb->data[i] == CRB_SEPARATOR) continue;
-            
-            if (crb->data[i] > sorted_lbas[0]) {
-                insert_position = i;
-                while (insert_position > 0 && crb->data[insert_position - 1] != CRB_SEPARATOR) {
-                    insert_position--;
-                }
-                break;
-            }
-        }
-        
-        // 移动现有数据
-        if (insert_position < crb->size) {
-            memmove(&crb->data[insert_position + sorted_size + 1],
-                   &crb->data[insert_position],
-                   (crb->size - insert_position) * sizeof(uint8_t));
-        }
-        
-        // 插入分隔符和新数据
-        if (insert_position < crb->size) {
-            crb->data[insert_position] = CRB_SEPARATOR;
-        }
-        memcpy(&crb->data[insert_position + (insert_position < crb->size ? 1 : 0)], 
-               sorted_lbas, sorted_size * sizeof(uint8_t));
-        
-        crb->size = new_total_size;
-    }
-    
-    crb->segment_count = count_segments(crb);
-    free(sorted_lbas);
-    memoryUsed += (sorted_size * sizeof(uint8_t));
-}
-
-// 从CRB中删除指定的LBA
-void crb_remove_lba(CRB *crb, uint8_t lba_offset) {
-    if (!crb || !crb->data || crb->size == 0) return;
-    
-    for (int i = 0; i < crb->size; i++) {
-        if (crb->data[i] == lba_offset) {
-            // 移动后面的元素
-            for (int j = i; j < crb->size - 1; j++) {
-                crb->data[j] = crb->data[j + 1];
-            }
-            crb->size--;
-            
-            // 如果删除后段为空，需要移除分隔符
-            if (i > 0 && crb->data[i - 1] == CRB_SEPARATOR && 
-                (i >= crb->size || crb->data[i] == CRB_SEPARATOR)) {
-                // 移除分隔符
-                for (int j = i - 1; j < crb->size - 1; j++) {
-                    crb->data[j] = crb->data[j + 1];
-                }
-                crb->size--;
-            }
-            
-            crb->segment_count = count_segments(crb);
-            break;
-        }
-    }
-}
-
 void FTLInit() {
     ftl = calloc(1, sizeof(FTL));
-    if (!ftl) return;
+    if (!ftl) {
+        return;
+    }
     
     memoryUsed += sizeof(FTL);
     ftl->write_buffer.next_ppn = 1000;
-    ftl->write_buffer.count = 0;
-    memset(ftl->write_buffer.lba, 0, sizeof(ftl->write_buffer.lba));
-    
-    for(int i = 0; i < NUMBER_OF_SECTORS; i++) {
-        init_crb(&ftl->t[i].crb);
-        ftl->t[i].levels = NULL;
-        ftl->t[i].level_count = 0;
-    }
 }
 
 void FTLDestroy() {
@@ -278,7 +72,6 @@ void FTLDestroy() {
         if (ftl->t[i].levels) {
             free(ftl->t[i].levels);
         }
-        free_crb(&ftl->t[i].crb);
     }
     free(ftl);
     ftl = NULL;
@@ -296,76 +89,43 @@ void sort_lba_array(uint64_t *lba_array, int size) {
     }
 }
 
+// 判断section是否有效
 bool is_section_valid(section *sec) {
     return sec->start != INVALID_START;
 }
 
+// 重叠检测函数
 bool is_overlap(section *a, section *b) {
+    // 如果任意一个section无效，则不重叠
     if (!is_section_valid(a) || !is_section_valid(b)) {
         return false;
     }
     
-    uint8_t a_end = (a->length > 0) ? (a->start + a->length) : a->start;
-    uint8_t b_end = (b->length > 0) ? (b->start + b->length) : b->start;
+    // 处理单个元素的情况
+    uint8_t a_end = a->accuracy ? (a->start + a->length) : a->start;
+    uint8_t b_end = b->accuracy ? (b->start + b->length) : b->start;
     
-    if (a->length == 0 && b->length == 0) {
+    // 对于单个元素，我们只检查精确匹配
+    if (!a->accuracy && !b->accuracy) {
         return a->start == b->start;
     }
     
+    // 对于连续序列，检查范围重叠
     return !(a->start > b_end || a_end < b->start);
 }
 
-void remove_section_from_level(levelsec *lsec, int index) {
-    if (!lsec || index < 0 || index >= lsec->size) {
-        return;
-    }
-    
-    for (int i = index; i < lsec->size - 1; i++) {
-        lsec->sec[i] = lsec->sec[i + 1];
-    }
-    lsec->size--;
-    
-    if (lsec->capacity > 4 && lsec->size < lsec->capacity / 2) {
-        uint8_t new_capacity = lsec->capacity / 2;
-        section *new_secs = realloc(lsec->sec, new_capacity * sizeof(section));
-        if (new_secs) {
-            lsec->sec = new_secs;
-            lsec->capacity = new_capacity;
-            memoryUsed -= (lsec->capacity - new_capacity) * sizeof(section);
-        }
-    }
-}
-
-// 插入精确段时，从CRB中删除重复的LBA
-void remove_lba_from_crb(int group, section *exact_sec) {
-    if (!ftl || group < 0 || group >= NUMBER_OF_SECTORS) return;
-    
-    CRB *crb = &ftl->t[group].crb;
-    
-    if (exact_sec->length == 0) {
-        // 单个元素
-        crb_remove_lba(crb, exact_sec->start);
-    } else {
-        // 连续序列
-        for (uint8_t offset = exact_sec->start; offset <= exact_sec->start + exact_sec->length; offset += (exact_sec->step > 0 ? exact_sec->step : 1)) {
-            crb_remove_lba(crb, offset);
-        }
-    }
-}
-
+// 简化的Insert函数 - 使用无效化而不是内存重新分配
 void Insert(int idx, section new_sec, int start_level) {
     memoryUsed += sizeof(section);
-    if (!ftl || idx < 0 || idx >= NUMBER_OF_SECTORS) return;
-    
-    // 如果是精确段，从CRB中删除重复的LBA
-    if (new_sec.accuracy) {
-        remove_lba_from_crb(idx, &new_sec);
+    if (!ftl || idx < 0 || idx >= NUMBER_OF_SECTORS) {
+        return;
     }
     
     int current_level = start_level;
     section current_sec = new_sec;
     
     while (current_level < MAX_RECURSION_DEPTH) {
+        // 确保有足够的层级
         while (ftl->t[idx].level_count <= current_level) {
             uint8_t new_count = ftl->t[idx].level_count + 1;
             levelsec *new_levels = realloc(ftl->t[idx].levels, new_count * sizeof(levelsec));
@@ -382,6 +142,7 @@ void Insert(int idx, section new_sec, int start_level) {
         section *conflict_sec = NULL;
         int conflict_index = -1;
         
+        // 在当前层查找冲突的section
         for (int i = 0; i < current_level_ptr->size; i++) {
             section *existing_sec = &current_level_ptr->sec[i];
             if (is_section_valid(existing_sec) && is_overlap(existing_sec, &current_sec)) {
@@ -392,10 +153,13 @@ void Insert(int idx, section new_sec, int start_level) {
         }
         
         if (conflict_sec != NULL) {
+            // 保存冲突的section，准备移到下一层
             section temp_sec = *conflict_sec;
-            remove_section_from_level(current_level_ptr, conflict_index);
-            memoryUsed -= sizeof(section);
             
+            // 无效化当前层的冲突section
+            conflict_sec->start = INVALID_START;
+            
+            // 插入当前section到当前层
             if (current_level_ptr->size >= current_level_ptr->capacity) {
                 uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
                 section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
@@ -405,9 +169,11 @@ void Insert(int idx, section new_sec, int start_level) {
             }
             current_level_ptr->sec[current_level_ptr->size++] = current_sec;
             
+            // 将冲突的section作为下一轮要处理的section
             current_sec = temp_sec;
             current_level++;
         } else {
+            // 没有冲突，直接插入当前层
             if (current_level_ptr->size >= current_level_ptr->capacity) {
                 uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
                 section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
@@ -421,66 +187,21 @@ void Insert(int idx, section new_sec, int start_level) {
     }
 }
 
+// 检查LBA是否在写缓冲区中
 bool is_lba_in_write_buffer(uint64_t lba) {
-    if (!ftl || ftl->write_buffer.count == 0) return false;
+    if (!ftl || ftl->write_buffer.count == 0) {
+        return false;
+    }
     
     for (int i = 0; i < ftl->write_buffer.count; i++) {
-        if (ftl->write_buffer.lba[i] == lba) return true;
+        if (ftl->write_buffer.lba[i] == lba) {
+            return true;
+        }
     }
     return false;
 }
 
-// 在section中查找LBA
-uint64_t search_in_sections(table *t, uint8_t offset) {
-    bool findincrb = false; // 是否在CRB找过
-    
-    for (int level = 0; level < t->level_count; level++) {
-        levelsec *lsec = &t->levels[level];
-        
-        for (int i = 0; i < lsec->size; i++) {
-            section *sec = &lsec->sec[i];
-            
-            if (!is_section_valid(sec)) continue;
-            
-            if (sec->length == 0) {
-                // 单个元素
-                if (offset == sec->start) {
-                    return sec->b;
-                }
-            } else {
-                // 连续序列
-                if (offset >= sec->start && offset <= sec->start + sec->length) {
-                    if (sec->accuracy) {
-                        // 精确段：直接计算
-                        if (sec->step == 0) {
-                            // 步长为0，检查是否正好是起始点
-                            if (offset == sec->start) {
-                                return sec->b;
-                            }
-                        } else if (sec->step > 0 && (offset - sec->start) % sec->step == 0) {
-                            uint32_t ppa_offset = (offset - sec->start) / sec->step;
-                            return sec->b + ppa_offset * FLASH_PAGE_SIZE;
-                        }
-                    } else {
-                        // 近似段：在CRB中查找
-                        if (!findincrb) {
-                            int segment_index, position_in_segment;
-                            if (crb_search(&t->crb, offset, &segment_index, &position_in_segment)) {
-                                // 在CRB中找到，计算PBA
-                                return sec->b + position_in_segment * FLASH_PAGE_SIZE;
-                            }
-                            findincrb = true; // 标记已经查找过CRB
-                        }
-                        // 无论是否找到，都跳出当前段继续查找
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    return 0;
-}
-
+// ProcessWriteBuffer函数
 void ProcessWriteBuffer() {
     if (!ftl || ftl->write_buffer.count == 0) return;
     
@@ -491,6 +212,7 @@ void ProcessWriteBuffer() {
     while (idx < ftl->write_buffer.count) {
         int current_group = ftl->write_buffer.lba[idx] / SECTORS_PER_GROUP;
         
+        // 找到当前组的结束位置
         int group_end = idx;
         for (int i = idx + 1; i < ftl->write_buffer.count; i++) {
             if (ftl->write_buffer.lba[i] / SECTORS_PER_GROUP != current_group) {
@@ -500,85 +222,56 @@ void ProcessWriteBuffer() {
             group_end = i;
         }
         
+        // 处理当前组内的所有连续序列
         int group_idx = idx;
         while (group_idx <= group_end) {
-            int* data = NULL;
-            int size = 0;
             section sec;
             sec.start = ftl->write_buffer.lba[group_idx] % SECTORS_PER_GROUP;
             sec.b = current_ppn * FLASH_PAGE_SIZE;
+            // 不再设置valid字段
             
+            // 检查是否是单个元素
             if (group_idx == group_end) {
-                // 单个元素
                 sec.length = 0;
                 sec.step = 0;
-                sec.accuracy = true;
+                sec.accuracy = 0;
                 Insert(current_group, sec, 0);
-                current_ppn++;
+                current_ppn += 1;
                 group_idx++;
                 continue;
             }
             
-            data = malloc(sizeof(int));
-            data[0] = ftl->write_buffer.lba[group_idx] % SECTORS_PER_GROUP;
-            size = 1;
-            
+            // 检查步长
             int step = ftl->write_buffer.lba[group_idx + 1] - ftl->write_buffer.lba[group_idx];
             int sequence_end = group_idx;
-            bool is_continuous = true;
             
+            // 查找具有相同步长的连续序列
             for (int i = group_idx + 1; i <= group_end; i++) {
-                int current_step = ftl->write_buffer.lba[i] - ftl->write_buffer.lba[i - 1];
-                
-                if (i == group_idx + 1) {
-                    // 第一个元素，设置初始步长
-                    step = current_step;
-                    size++;
-                    int *data_ = (int*)realloc(data, sizeof(int) * size);
-                    data = data_;
-                    data[size - 1] = ftl->write_buffer.lba[i] % SECTORS_PER_GROUP;
+                if (ftl->write_buffer.lba[i] - ftl->write_buffer.lba[i - 1] == step) {
                     sequence_end = i;
                 } else {
-                    // 检查步长是否在容忍范围内
-                    if (abs(current_step - step) <= tolerance) {
-                        size++;
-                        int *data_ = (int*)realloc(data, sizeof(int) * size);
-                        data = data_;
-                        data[size - 1] = ftl->write_buffer.lba[i] % SECTORS_PER_GROUP;
-                        
-                        if (current_step == step) {
-                            sequence_end = i;
-                        } else {
-                            is_continuous = false;
-                        }
-                    } else {
-                        break;
-                    }
+                    break;
                 }
             }
             
-            if (sequence_end > group_idx && is_continuous) {
-                // 连续序列 - 精确段
+            if (sequence_end > group_idx) {
+                // 找到连续序列
                 sec.length = (ftl->write_buffer.lba[sequence_end] % SECTORS_PER_GROUP) - 
                             (ftl->write_buffer.lba[group_idx] % SECTORS_PER_GROUP);
                 sec.step = step;
-                sec.accuracy = true;
+                sec.accuracy = 1;
                 Insert(current_group, sec, 0);
                 current_ppn += (sequence_end - group_idx) + 1;
                 group_idx = sequence_end + 1;
             } else {
-                // 非连续序列 - 近似段
-                sec.length = (ftl->write_buffer.lba[group_idx + size - 1] % SECTORS_PER_GROUP) - 
-                            (ftl->write_buffer.lba[group_idx] % SECTORS_PER_GROUP);
-                sec.step = 0; // 近似段step为0
-                sec.accuracy = false;
+                // 单个元素
+                sec.length = 0;
+                sec.step = 0;
+                sec.accuracy = 0;
                 Insert(current_group, sec, 0);
-                crbinsert(current_group, data, size);
-                current_ppn += size;
-                group_idx += size;
+                current_ppn += 1;
+                group_idx++;
             }
-            
-            free(data);
         }
         
         idx = group_end + 1;
@@ -588,11 +281,13 @@ void ProcessWriteBuffer() {
     ftl->write_buffer.count = 0;
 }
 
+// 修改FTLRead函数，在读取前检查写缓冲区
 uint64_t FTLRead(uint64_t lba) {
     if (!ftl) {
         return 0;
     }
     
+    // 检查LBA是否在写缓冲区中，如果是则先处理缓冲区
     if (is_lba_in_write_buffer(lba)) {
         ProcessWriteBuffer();
     }
@@ -601,22 +296,63 @@ uint64_t FTLRead(uint64_t lba) {
     uint8_t offset = lba % SECTORS_PER_GROUP;
     
     if (idx < 0 || idx >= NUMBER_OF_SECTORS) {
+        printf("[FTLRead Error] Invalid index: %d for LBA: %lu\n", idx, lba);
         return 0;
     }
     
     table *t = &ftl->t[idx];
-    return search_in_sections(t, offset);
+    
+    // 从顶层到底层搜索
+    for (int level = 0; level < t->level_count; level++) {
+        levelsec *lsec = &t->levels[level];
+        
+        for (int i = 0; i < lsec->size; i++) {
+            section *sec = &lsec->sec[i];
+            
+            // 跳过无效的section
+            if (!is_section_valid(sec)) {
+                continue;
+            }
+            
+            // 检查LBA是否在这个段内
+            if (offset >= sec->start && offset <= sec->start + sec->length) {
+                if (sec->accuracy) {
+                    // 精确映射：使用步长计算
+                    if (sec->step > 0) {
+                        // 检查是否在步长点上
+                        if ((offset - sec->start) % sec->step == 0) {
+                            uint32_t ppa_offset = (offset - sec->start) / sec->step;
+                            uint64_t result = sec->b + ppa_offset * FLASH_PAGE_SIZE;
+                            return result;
+                        }
+                    }
+                } else {
+                    // 近似段（单个点）：直接匹配start值
+                    if (offset == sec->start) {
+                        return sec->b;
+                    }
+                }
+                break; // 在这个段中但没找到匹配，跳出内层循环
+            }
+        }
+    }
+    
+    return 0; // 未找到映射
 }
 
 bool FTLModify(uint64_t lba) {
-    if (!ftl) return false;
+    if (!ftl) {
+        return false;
+    }
     
+    // 添加到写缓冲区
     if (ftl->write_buffer.count < WRITE_BUFFER_SIZE) {
         ftl->write_buffer.lba[ftl->write_buffer.count++] = lba;
     } else {
         return false;
     }
     
+    // 如果缓冲区满了，处理缓冲区
     if (ftl->write_buffer.count >= WRITE_BUFFER_SIZE) {
         ProcessWriteBuffer();
     }
@@ -625,7 +361,11 @@ bool FTLModify(uint64_t lba) {
 }
 
 uint32_t AlgorithmRun(IOVector *ioVector, const char *filename) {
-    if (!ioVector || !ioVector->ioArray) {
+    if (!ioVector) {
+        return RETURN_ERROR;
+    }
+    
+    if (!ioVector->ioArray) {
         return RETURN_ERROR;
     }
     
@@ -636,10 +376,14 @@ uint32_t AlgorithmRun(IOVector *ioVector, const char *filename) {
         return RETURN_ERROR;
     }
     
+    // 初始化 FTL
     FTLInit();
+    
+    // 重置内存统计
     memoryUsed = 0;
     memoryMax = 0;
 
+    // 记录开始时间
     gettimeofday(&start, NULL);
 
     for (uint64_t i = 0; i < ioVector->len; ++i) {
@@ -657,23 +401,27 @@ uint32_t AlgorithmRun(IOVector *ioVector, const char *filename) {
         }
     }
     
+    // 处理缓冲区中剩余的数据
     ProcessWriteBuffer();
+
+    // 记录结束时间
     gettimeofday(&end, NULL);
+
     FTLDestroy();
 
     if (file != stdout) {
         fclose(file);
     }
     
+    // 计算秒数和微秒数
     long seconds = end.tv_sec - start.tv_sec;
     long useconds = end.tv_usec - start.tv_usec;
-    double memory = (double)memoryMax / (1024.0 * 1024.0);
-    double during = (seconds * 1000000.0 + useconds) / 1000.0;
-    double throughput = ioVector->len / during;
-    
-    printf("algorithmRunningDuration:\t %f ms\n", during);
-    printf("Throughput:\t\t\t %f operations/ms\n", throughput);
-    printf("Max memory used:\t\t %f MB\n", memory);
+
+    // 总微秒数
+    double during = (seconds * 1000000.0 + useconds) / 1000.0;  // 转换为毫秒
+    double throughput = (double)ioVector->len / during;
+    printf("algorithmRunningDuration:\t %f ms\n", throughput);
+    printf("Max memory used:\t\t %llu B\n", (unsigned long long)memoryMax);
 
     return RETURN_OK;
 }
