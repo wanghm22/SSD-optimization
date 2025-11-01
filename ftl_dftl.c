@@ -8,8 +8,8 @@
 
 #define MAX_MAPPING_ENTRIES (64 * 1000 * 1000)
 #define CACHE_SIZE 16
-#define PPN_COUNT 500000
-#define BLOCKS_PER_PAGE 128
+#define PPN_COUNT 1000000
+#define BLOCKS_PER_PAGE 64
 #define BLOCK_SIZE 4096
 #define CACHE_GROUP 15625
 
@@ -19,22 +19,19 @@ static uint64_t memoryMax = 0;
 typedef struct {
     int size;
     int idx; //表示Cache存储的是第几组PPN
-    uint64_t valid[2];
-
-    uint32_t pba;
+    uint64_t valid;
+    uint64_t pba;
 } cache_entry;
 
 typedef struct {
-    uint64_t valid[2]; // 0表示低64个块，1表示高64个块
-    uint32_t pba;
-    
+    uint64_t valid;
+    uint64_t pba;
 } ppn_entry;
 
 typedef struct {
     ppn_entry *ppn;
     cache_entry cache[CACHE_SIZE];
     uint64_t incache[CACHE_GROUP]; // 记录哪些ppn组在cache中
-   
 } FTL;
 
 static FTL *ftl = NULL;
@@ -54,20 +51,15 @@ void FTLInit() {
         exit(EXIT_FAILURE);
     }
     for(int i=0;i<PPN_COUNT;++i){
-        ftl->ppn[i].valid[0]=0;
-        ftl->ppn[i].valid[1]=0;
+        ftl->ppn[i].valid=0;
         ftl->ppn[i].pba=i*1000;
     }
-    
     // 初始化cache
     for (int i = 0; i < CACHE_SIZE; ++i) {
         ftl->cache[i].idx = -1;
         ftl->cache[i].size = 0;
-        ftl->cache[i].valid[0]=0;
-        ftl->cache[i].valid[1]=0;
+        ftl->cache[i].valid = 0;
         ftl->cache[i].pba = (i+PPN_COUNT)*1000;
-        
-        
     }
     for(int i=0;i<CACHE_GROUP;++i){
         ftl->incache[i]=0;
@@ -91,23 +83,16 @@ void FTLDestroy() {
 }
 
 uint64_t FTLRead(uint64_t lba) {
-    
     if (!ftl) return 0;
     
-    int ppn_index = lba / BLOCKS_PER_PAGE;
-    
+    uint64_t ppn_index = lba / BLOCKS_PER_PAGE;
     int offset = lba % BLOCKS_PER_PAGE;
-    
     int ppn_group = ppn_index / 64;
     int ppn_offset = ppn_index % 64;
-    int smallidx;
-    int newoffset;
-    if(offset>=64){smallidx=0;newoffset=offset-64;}
-    else{newoffset=offset;smallidx=1;}
-    if((ftl->incache[ppn_group]&(1<<ppn_offset))!=0){//本组在cache中
+    if((ftl->incache[ppn_group]&(1<<ppn_offset))!=0){
         for(int i=0;i<CACHE_SIZE;++i){
             if(ftl->cache[i].idx==ppn_index){
-                if((ftl->cache[i].valid[smallidx]&(1<<newoffset))!=0){return ftl->cache[i].pba+offset;}
+                if((ftl->cache[i].valid&(1<<offset))!=0){return ftl->cache[i].pba+offset;}
             } 
         }
     }
@@ -116,10 +101,10 @@ uint64_t FTLRead(uint64_t lba) {
     
     // 在PPN中查找
     
-    return ftl->ppn[ppn_index].pba + offset;
+    return ftl->ppn[ppn_index].pba + offset ;
     
     
-    
+     // 未找到
 }
 
 int CleanCache() {
@@ -134,8 +119,8 @@ int CleanCache() {
         }
     }
     
-    if (max_size == 0) {
-        return -1;
+    if (max_index == -1 || max_size == 0) {
+        return 0;
     }
     
     
@@ -143,7 +128,7 @@ int CleanCache() {
     int ppn_offset = ftl->cache[max_index].idx % 64;
     ftl->incache[ppn_group] &= ~(1<<ppn_offset);//将cache中的ppn组标记为不在cache中
     // 将cache内容写回PPN
-    int ppn_index = ftl->cache[max_index].idx;
+    uint64_t ppn_index = ftl->cache[max_index].idx;
     uint64_t thepba =ftl->ppn[ppn_index].pba;
     ftl->ppn[ppn_index].pba = ftl->cache[max_index].pba;
     
@@ -151,45 +136,35 @@ int CleanCache() {
     ftl->cache[max_index].idx = -1;
     ftl->cache[max_index].size = 0;
     ftl->cache[max_index].pba = thepba;
-    ftl->cache[max_index].valid[0] = 0;
-    ftl->cache[max_index].valid[1] = 0;
+    ftl->cache[max_index].valid = 0;
     
     return max_index;
 }
 
 bool FTLModify(uint64_t lba) {
-   
     if (!ftl) return false;
     
-    int ppn_index = lba / BLOCKS_PER_PAGE;
-    int offset = lba % BLOCKS_PER_PAGE;
-    int smallidx;
-    int newoffset;
-    if(offset>=64){smallidx=0;newoffset=offset-64;}
-    else{smallidx=1;newoffset=offset;}
+    uint64_t ppn_index = lba / BLOCKS_PER_PAGE;
+    uint64_t offset = lba % BLOCKS_PER_PAGE;
     
     if (ppn_index >= PPN_COUNT) {
         return false; // 越界
     }
-    
-    if((ftl->ppn[ppn_index].valid[smallidx]&(1<<newoffset))==0){
-        ftl->ppn[ppn_index].valid[smallidx]= (ftl->ppn[ppn_index].valid[smallidx]|(1<<newoffset));
-      
+    if((ftl->ppn[ppn_index].valid&(1<<offset))==0){
+        ftl->ppn[ppn_index].valid |= (1<<offset);
         
-        return true;}
-    //不是重写，直接秒
+        return true;}//不是重写，直接秒
     int ppn_group = ppn_index / 64;
     int ppn_offset = ppn_index % 64;
     if((ftl->incache[ppn_group]&(1<<ppn_offset))!=0){//本组在cache中
         for(int i=0;i<CACHE_SIZE;++i){
             if(ftl->cache[i].idx==ppn_index){
-                
-                if((ftl->cache[i].valid[smallidx]&(1<<newoffset))==0){
-                    ftl->cache[i].valid[smallidx] = (ftl->cache[i].valid[smallidx]|(1<<newoffset));
+                if((ftl->cache[i].valid&(1<<offset))==0){
+                    ftl->cache[i].valid |= (1<<offset);
                     return true;}
                 else{
                     
-                    ftl->incache[ppn_group] = ftl->incache[ppn_group] & ~(1<<ppn_offset);//将cache中的ppn组标记为不在cache中
+                    ftl->incache[ppn_group] &= ~(1<<ppn_offset);//将cache中的ppn组标记为不在cache中
     // 将cache内容写回PPN
                     
                     uint64_t thepba =ftl->ppn[ppn_index].pba;
@@ -199,8 +174,7 @@ bool FTLModify(uint64_t lba) {
                     ftl->cache[i].idx = -1;
                     ftl->cache[i].size = 0;
                     ftl->cache[i].pba = thepba;
-                    ftl->cache[i].valid[0] = 0;
-                    ftl->cache[i].valid[1] = 0;
+                    ftl->cache[i].valid = 0;
                     return true;
                 }
             }
@@ -212,8 +186,8 @@ bool FTLModify(uint64_t lba) {
             ftl->cache[i].idx=ppn_index;
             ftl->cache[i].size=1;
 
-            ftl->cache[i].valid[smallidx]=(ftl->cache[i].valid[smallidx]|(1<<newoffset));
-            ftl->incache[ppn_group]|=(1<<ppn_offset);//将cache中的ppn组标记为在cache中
+            ftl->cache[i].valid|=1<<offset;
+            ftl->incache[ppn_group]|=1<<ppn_offset;//将cache中的ppn组标记为在cache中
             return true;
         }
     }
@@ -221,8 +195,8 @@ bool FTLModify(uint64_t lba) {
     ftl->cache[theindex].idx=ppn_index;
     ftl->cache[theindex].size=1;
 
-    ftl->cache[theindex].valid[smallidx]=(ftl->cache[theindex].valid[smallidx]|(1<<newoffset));
-    ftl->incache[ppn_group]=(ftl->incache[ppn_group]|(1<<ppn_offset));//将cache中的ppn组标记为在cache中
+    ftl->cache[theindex].valid|=1<<offset;
+    ftl->incache[ppn_group]|=1<<ppn_offset;//将cache中的ppn组标记为在cache中
     return true;
     
     
@@ -270,8 +244,8 @@ uint32_t AlgorithmRun(IOVector *ioVector, const char *outputFile) {
     useconds = end.tv_usec - start.tv_usec;
 
     during = (seconds * 1000000.0 + useconds) / 1000.0;
-    float throughput = (double) ioVector->len / during;
-    printf("algorithmRunningThroughput:\t %f ms\n", throughput);
+    double throughput = (double) ioVector->len / during;
+    printf("algorithmRunningDuration:\t %f ms\n", throughput);
     printf("Max memory used:\t\t %llu B\n", (unsigned long long)memoryMax);
 
     return RETURN_OK;

@@ -27,7 +27,8 @@ typedef struct {
     uint8_t start;
     uint8_t length;
     uint8_t step;
-    uint32_t b;   //应该可以移除
+    uint32_t b; 
+    bool accuracy;  
     // 移除了valid字段
 } section;
 
@@ -101,217 +102,82 @@ bool is_overlap(section *a, section *b) {
     }
     
     // 处理单个元素的情况
-    uint8_t a_end =(a->start + a->length) ;
-    uint8_t b_end =(b->start + b->length) ;
+    uint8_t a_end = a->accuracy ? (a->start + a->length) : a->start;
+    uint8_t b_end = b->accuracy ? (b->start + b->length) : b->start;
     
     // 对于单个元素，我们只检查精确匹配
-    
+    if (!a->accuracy && !b->accuracy) {
+        return a->start == b->start;
+    }
     
     // 对于连续序列，检查范围重叠
     return !(a->start > b_end || a_end < b->start);
 }
 
 // 简化的Insert函数 - 使用无效化而不是内存重新分配
-// 使用迭代方式优化的Insert函数
-// 修复后的Insert函数
-// 修改Insert函数，添加循环深度限制
-// 完整的带有循环深度限制的Insert函数
 void Insert(int idx, section new_sec, int start_level) {
     memoryUsed += sizeof(section);
-
     if (!ftl || idx < 0 || idx >= NUMBER_OF_SECTORS) {
         return;
     }
-
+    
     int current_level = start_level;
     section current_sec = new_sec;
-
+    
     while (current_level < MAX_RECURSION_DEPTH) {
-        // 确保层级有足够的空间
+        // 确保有足够的层级
         while (ftl->t[idx].level_count <= current_level) {
             uint8_t new_count = ftl->t[idx].level_count + 1;
             levelsec *new_levels = realloc(ftl->t[idx].levels, new_count * sizeof(levelsec));
-            if (!new_levels) {
-                fprintf(stderr, "Failed to realloc memory for levels\n");
-                return;
-            }
+            if (!new_levels) return;
             ftl->t[idx].levels = new_levels;
-
-            // 初始化新扩展的层级
+            
             ftl->t[idx].levels[ftl->t[idx].level_count].sec = NULL;
             ftl->t[idx].levels[ftl->t[idx].level_count].size = 0;
             ftl->t[idx].levels[ftl->t[idx].level_count].capacity = 0;
             ftl->t[idx].level_count = new_count;
         }
-
+        
         levelsec *current_level_ptr = &ftl->t[idx].levels[current_level];
         section *conflict_sec = NULL;
         int conflict_index = -1;
-
-        // 查找冲突的section
+        
+        // 在当前层查找冲突的section
         for (int i = 0; i < current_level_ptr->size; i++) {
             section *existing_sec = &current_level_ptr->sec[i];
-            if (existing_sec->start != 0xFF && is_overlap(existing_sec, &current_sec)) {
+            if (is_section_valid(existing_sec) && is_overlap(existing_sec, &current_sec)) {
                 conflict_sec = existing_sec;
                 conflict_index = i;
                 break;
             }
         }
-
+        
         if (conflict_sec != NULL) {
-            // 如果存在重叠的section，根据重叠类型进行处理
-
-            // 1. **新section被旧section完全包含**：把旧section分割成三部分
-            if (current_sec.start <= conflict_sec->start && (current_sec.start + current_sec.length) >= (conflict_sec->start + conflict_sec->length)) {
-                // 保留中间重叠部分到下一层
-                section front_part = *conflict_sec;
-                section overlap_part = *conflict_sec;
-                section back_part = *conflict_sec;
-
-                // 前后部分无重叠，保持在当前层
-                front_part.length = current_sec.start - front_part.start;
-                back_part.start = current_sec.start + current_sec.length;
-                back_part.length = (front_part.start + front_part.length) - back_part.start;
-
-                // 重叠部分推到下一层
-                overlap_part.start = current_sec.start;
-                overlap_part.length = current_sec.length;
-
-                conflict_sec->start = 0xFF;  // 无效化当前冲突的section
-
-                // 插入前后部分到当前层
-                if (front_part.length > 0) {
-                    if (current_level_ptr->size >= current_level_ptr->capacity) {
-                        uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
-                        section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
-                        if (!new_secs) {
-                            fprintf(stderr, "Failed to realloc memory for sections\n");
-                            return;
-                        }
-                        current_level_ptr->sec = new_secs;
-                        current_level_ptr->capacity = new_capacity;
-                    }
-                    current_level_ptr->sec[current_level_ptr->size++] = front_part;
-                }
-
-                if (back_part.length > 0) {
-                    if (current_level_ptr->size >= current_level_ptr->capacity) {
-                        uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
-                        section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
-                        if (!new_secs) {
-                            fprintf(stderr, "Failed to realloc memory for sections\n");
-                            return;
-                        }
-                        current_level_ptr->sec = new_secs;
-                        current_level_ptr->capacity = new_capacity;
-                    }
-                    current_level_ptr->sec[current_level_ptr->size++] = back_part;
-                }
-
-                // 将重叠部分插入下一层
-                if (overlap_part.length > 0) {
-                    Insert(idx, overlap_part, current_level + 1);
-                }
-
-                // 当前层已经处理完，直接退出
-                break;
-            }
-
-            // 2. **新section仅与旧section的前部重叠**：将旧section分割
-            else if (current_sec.start < (conflict_sec->start + conflict_sec->length) && (current_sec.start + current_sec.length) <= (conflict_sec->start + conflict_sec->length)) {
-                // 旧section的前部分与新section重叠，后部分保持在当前层
-                section overlap_part = *conflict_sec;
-                section back_part = *conflict_sec;
-
-                // 前部分无重叠，保持在当前层
-                overlap_part.length = current_sec.start - overlap_part.start;
-                back_part.start = current_sec.start + current_sec.length;
-                back_part.length = (overlap_part.start + overlap_part.length) - back_part.start;
-
-                conflict_sec->start = 0xFF;  // 无效化当前冲突的section
-
-                // 插入前部分到当前层
-                if (overlap_part.length > 0) {
-                    if (current_level_ptr->size >= current_level_ptr->capacity) {
-                        uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
-                        section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
-                        if (!new_secs) {
-                            fprintf(stderr, "Failed to realloc memory for sections\n");
-                            return;
-                        }
-                        current_level_ptr->sec = new_secs;
-                        current_level_ptr->capacity = new_capacity;
-                    }
-                    current_level_ptr->sec[current_level_ptr->size++] = overlap_part;
-                }
-
-                // 插入后部分到当前层
-                if (back_part.length > 0) {
-                    if (current_level_ptr->size >= current_level_ptr->capacity) {
-                        uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
-                        section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
-                        if (!new_secs) {
-                            fprintf(stderr, "Failed to realloc memory for sections\n");
-                            return;
-                        }
-                        current_level_ptr->sec = new_secs;
-                        current_level_ptr->capacity = new_capacity;
-                    }
-                    current_level_ptr->sec[current_level_ptr->size++] = back_part;
-                }
-
-                // 将重叠部分插入下一层
-                Insert(idx, overlap_part, current_level + 1);
-
-                // 当前层已经处理完，直接退出
-                break;
-            }
-
-            // 3. **新section仅与旧section的后部重叠**：将旧section分割
-            else if (current_sec.start >= conflict_sec->start && (current_sec.start + current_sec.length) > conflict_sec->start) {
-                // 旧section的后部分与新section重叠，前部分保持在当前层
-                section front_part = *conflict_sec;
-                section overlap_part = *conflict_sec;
-
-                // 后部分无重叠，保持在当前层
-                front_part.length = current_sec.start - front_part.start;
-                overlap_part.start = current_sec.start + current_sec.length;
-                overlap_part.length = front_part.length - overlap_part.start;
-
-                conflict_sec->start = 0xFF;  // 无效化当前冲突的section
-
-                // 插入前部分到当前层
-                if (front_part.length > 0) {
-                    if (current_level_ptr->size >= current_level_ptr->capacity) {
-                        uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
-                        section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
-                        if (!new_secs) {
-                            fprintf(stderr, "Failed to realloc memory for sections\n");
-                            return;
-                        }
-                        current_level_ptr->sec = new_secs;
-                        current_level_ptr->capacity = new_capacity;
-                    }
-                    current_level_ptr->sec[current_level_ptr->size++] = front_part;
-                }
-
-                // 插入重叠部分到下一层
-                if (overlap_part.length > 0) {
-                    Insert(idx, overlap_part, current_level + 1);
-                }
-
-                // 当前层已经处理完，直接退出
-                break;
-            }
-        } else {
-            // 4. **没有冲突，直接插入当前层**
+            // 保存冲突的section，准备移到下一层
+            section temp_sec = *conflict_sec;
+            
+            // 无效化当前层的冲突section
+            conflict_sec->start = INVALID_START;
+            
+            // 插入当前section到当前层
             if (current_level_ptr->size >= current_level_ptr->capacity) {
                 uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
                 section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
-                if (!new_secs) {
-                    fprintf(stderr, "Failed to realloc memory for sections\n");
-                    return;
-                }
+                if (!new_secs) return;
+                current_level_ptr->sec = new_secs;
+                current_level_ptr->capacity = new_capacity;
+            }
+            current_level_ptr->sec[current_level_ptr->size++] = current_sec;
+            
+            // 将冲突的section作为下一轮要处理的section
+            current_sec = temp_sec;
+            current_level++;
+        } else {
+            // 没有冲突，直接插入当前层
+            if (current_level_ptr->size >= current_level_ptr->capacity) {
+                uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
+                section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
+                if (!new_secs) return;
                 current_level_ptr->sec = new_secs;
                 current_level_ptr->capacity = new_capacity;
             }
@@ -321,11 +187,7 @@ void Insert(int idx, section new_sec, int start_level) {
     }
 }
 
-
-
-// 在AlgorithmRun函数结束时添加统计信息
-
-// 检查LBA是否在写缓冲区中
+// 检查写缓冲区中是否包含指定的LBA
 bool is_lba_in_write_buffer(uint64_t lba) {
     if (!ftl || ftl->write_buffer.count == 0) {
         return false;
@@ -372,7 +234,7 @@ void ProcessWriteBuffer() {
             if (group_idx == group_end) {
                 sec.length = 0;
                 sec.step = 0;
-               
+                sec.accuracy = 0;
                 Insert(current_group, sec, 0);
                 current_ppn += 1;
                 group_idx++;
@@ -397,7 +259,7 @@ void ProcessWriteBuffer() {
                 sec.length = (ftl->write_buffer.lba[sequence_end] % SECTORS_PER_GROUP) - 
                             (ftl->write_buffer.lba[group_idx] % SECTORS_PER_GROUP);
                 sec.step = step;
-                
+                sec.accuracy = 1;
                 Insert(current_group, sec, 0);
                 current_ppn += (sequence_end - group_idx) + 1;
                 group_idx = sequence_end + 1;
@@ -405,7 +267,7 @@ void ProcessWriteBuffer() {
                 // 单个元素
                 sec.length = 0;
                 sec.step = 0;
-               
+                sec.accuracy = 0;
                 Insert(current_group, sec, 0);
                 current_ppn += 1;
                 group_idx++;
@@ -419,14 +281,15 @@ void ProcessWriteBuffer() {
     ftl->write_buffer.count = 0;
 }
 
-// 修改FTLRead函数，在读取前检查写缓冲区
+// 修改FTLRead函数，在读之前检查写缓冲区
 uint64_t FTLRead(uint64_t lba) {
     if (!ftl) {
         return 0;
     }
     
-    // 检查LBA是否在写缓冲区中，如果是则先处理缓冲区
+    // 检查写缓冲区中是否有这个LBA
     if (is_lba_in_write_buffer(lba)) {
+        // 如果有，先处理写缓冲区
         ProcessWriteBuffer();
     }
     
@@ -454,7 +317,7 @@ uint64_t FTLRead(uint64_t lba) {
             
             // 检查LBA是否在这个段内
             if (offset >= sec->start && offset <= sec->start + sec->length) {
-                
+                if (sec->accuracy) {
                     // 精确映射：使用步长计算
                     if (sec->step > 0) {
                         // 检查是否在步长点上
@@ -464,7 +327,7 @@ uint64_t FTLRead(uint64_t lba) {
                             return result;
                         }
                     }
-                else {
+                } else {
                     // 近似段（单个点）：直接匹配start值
                     if (offset == sec->start) {
                         return sec->b;
@@ -556,8 +419,8 @@ uint32_t AlgorithmRun(IOVector *ioVector, const char *filename) {
     long useconds = end.tv_usec - start.tv_usec;
 
     // 总微秒数
-    double during = (seconds * 1000000.0 + useconds) / 1000.0;  // 转换为毫秒
-    double throughput = (double)ioVector->len / during;
+    double during = (seconds * 1000000.0 + useconds) / 1000.0; 
+    double throughput = (double)ioVector->len/during; // 转换为毫秒
     printf("algorithmRunningDuration:\t %f ms\n", throughput);
     printf("Max memory used:\t\t %llu B\n", (unsigned long long)memoryMax);
 
