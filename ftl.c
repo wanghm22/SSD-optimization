@@ -192,6 +192,7 @@ void Insert(int idx, section new_sec, int start_level) {
                         current_level_ptr->capacity = new_capacity;
                     }
                     current_level_ptr->sec[current_level_ptr->size++] = front_part;
+                    memoryUsed += sizeof(section);
                 }
 
                 if (back_part.length > 0) {
@@ -206,6 +207,7 @@ void Insert(int idx, section new_sec, int start_level) {
                         current_level_ptr->capacity = new_capacity;
                     }
                     current_level_ptr->sec[current_level_ptr->size++] = back_part;
+                    memoryUsed += sizeof(section);
                 }
 
                 // 将重叠部分插入下一层
@@ -243,6 +245,7 @@ void Insert(int idx, section new_sec, int start_level) {
                         current_level_ptr->capacity = new_capacity;
                     }
                     current_level_ptr->sec[current_level_ptr->size++] = overlap_part;
+                    memoryUsed += sizeof(section);
                 }
 
                 // 插入后部分到当前层
@@ -258,6 +261,7 @@ void Insert(int idx, section new_sec, int start_level) {
                         current_level_ptr->capacity = new_capacity;
                     }
                     current_level_ptr->sec[current_level_ptr->size++] = back_part;
+                    memoryUsed += sizeof(section);
                 }
 
                 // 将重叠部分插入下一层
@@ -293,6 +297,7 @@ void Insert(int idx, section new_sec, int start_level) {
                         current_level_ptr->capacity = new_capacity;
                     }
                     current_level_ptr->sec[current_level_ptr->size++] = front_part;
+                    memoryUsed += sizeof(section);
                 }
 
                 // 插入重叠部分到下一层
@@ -316,6 +321,7 @@ void Insert(int idx, section new_sec, int start_level) {
                 current_level_ptr->capacity = new_capacity;
             }
             current_level_ptr->sec[current_level_ptr->size++] = current_sec;
+            memoryUsed += sizeof(section);
             break;
         }
     }

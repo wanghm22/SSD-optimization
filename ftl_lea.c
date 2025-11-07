@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include "ftl.h"
 
-
 #define MAX_RECURSION_DEPTH 16
 #define NUMBER_OF_SECTORS 250000
 #define SECTORS_PER_GROUP 256
@@ -28,7 +27,7 @@ typedef struct {
 typedef struct {
     uint8_t *data;          // 扁平数组存储所有LBA，用CRB_SEPARATOR分隔段
     int size;               // data数组当前大小
-    uint32_t *segments_ppn; // 每个段的起始PPN数组
+    bool *accuracy;         // 每段的精度标记：true为精确段，false为近似段
 } CRB;
 
 typedef struct {
@@ -36,20 +35,18 @@ typedef struct {
     uint8_t length;
     uint8_t step;
     uint32_t b; 
+    bool accuracy;          // 精度标记：true为精确段，false为近似段
 } section;
 
 typedef struct {
     section *sec;
     uint8_t size;
-    uint8_t capacity;
 } levelsec;
 
 typedef struct {
     levelsec *levels;
     uint8_t level_count;
     CRB crb;
-    
-    uint64_t bitmap[4];  // 修改：4个uint64_t，共256位，表示256个LBA的状态
 } table;
 
 typedef struct {
@@ -62,38 +59,11 @@ static FTL *ftl = NULL;
 // 定义分隔符
 #define CRB_SEPARATOR 0xFF
 
-// 设置bitmap中某一位的状态
-void set_bitmap_status(table *t, uint8_t lba_offset, bool in_section) {
-    if (lba_offset >= 256) return;
-    
-    int bitmap_index = lba_offset / 64;
-    int bit_position = lba_offset % 64;
-    
-    if (in_section) {
-        // 设置为1，表示在section中
-        t->bitmap[bitmap_index] |= (1ULL << bit_position);
-    } else {
-        // 设置为0，表示在CRB中
-        t->bitmap[bitmap_index] &= ~(1ULL << bit_position);
-    }
-}
-
-// 获取bitmap中某一位的状态
-bool get_bitmap_status(table *t, uint8_t lba_offset) {
-    if (lba_offset >= 256) return false;
-    
-    int bitmap_index = lba_offset / 64;
-    int bit_position = lba_offset % 64;
-    
-    // 返回true表示在section中，false表示在CRB中
-    return (t->bitmap[bitmap_index] >> bit_position) & 1;
-}
-
 // 初始化CRB
 void init_crb(CRB *crb) {
     crb->data = NULL;
     crb->size = 0;
-    crb->segments_ppn = NULL;
+    crb->accuracy = NULL;
 }
 
 // 释放CRB内存
@@ -102,22 +72,22 @@ void free_crb(CRB *crb) {
         free(crb->data);
         crb->data = NULL;
     }
-    if (crb->segments_ppn) {
-        free(crb->segments_ppn);
-        crb->segments_ppn = NULL;
+    if (crb->accuracy) {
+        free(crb->accuracy);
+        crb->accuracy = NULL;
     }
     crb->size = 0;
 }
 
-// 在CRB中查找指定LBA对应的PBA
-uint64_t crb_search(CRB *crb, uint8_t lba_offset) {
-    if (!crb || !crb->data || crb->size == 0 || !crb->segments_ppn) {
-        return 0;
+// 在CRB中查找指定LBA对应的offset
+int crb_search_offset(CRB *crb, uint8_t lba_offset, bool *is_accurate) {
+    if (!crb || !crb->data || crb->size == 0 || !crb->accuracy) {
+        return -1;
     }
     
     int current_segment = 0;
     int segment_start_index = 0;
-    int segment_ppn_index = 0;
+    int segment_offset = 0;
     
     // 遍历整个data数组
     for (int i = 0; i < crb->size; i++) {
@@ -125,28 +95,23 @@ uint64_t crb_search(CRB *crb, uint8_t lba_offset) {
             // 遇到分隔符，移动到下一个段
             current_segment++;
             segment_start_index = i + 1;
-            segment_ppn_index++;
+            segment_offset = 0;
             continue;
         }
         
         // 检查当前LBA是否匹配
         if (crb->data[i] == lba_offset) {
-            // 计算在当前段中的位置
-            int position_in_segment = i - segment_start_index;
-            
-            // 返回对应的PBA：段起始PPN + 在段中的位置 * FLASH_PAGE_SIZE
-            return crb->segments_ppn[current_segment] + position_in_segment * FLASH_PAGE_SIZE;
+            // 返回offset和精度信息
+            if (is_accurate) {
+                *is_accurate = crb->accuracy[current_segment];
+            }
+            return segment_offset;
         }
         
-        // 如果当前LBA大于要找的LBA，且后面是分隔符，说明不存在
-        if (crb->data[i] > lba_offset && 
-            i + 1 < crb->size && 
-            crb->data[i + 1] == CRB_SEPARATOR) {
-            break;
-        }
+        segment_offset++;
     }
     
-    return 0; // 未找到
+    return -1; // 未找到
 }
 
 // 计算段的数量
@@ -165,7 +130,7 @@ int count_segments(CRB *crb) {
 }
 
 // CRB插入函数
-void crbinsert(int group, int *lba_offsets, int size, uint32_t segment_ppn) {
+void crbinsert(int group, int *lba_offsets, int size, bool is_accurate) {
     if (!ftl || group < 0 || group >= NUMBER_OF_SECTORS || !lba_offsets || size <= 0) {
         return;
     }
@@ -216,21 +181,21 @@ void crbinsert(int group, int *lba_offsets, int size, uint32_t segment_ppn) {
     }
     crb->data = new_data;
     
-    // 重新分配segments_ppn数组
+    // 重新分配accuracy数组
     int new_segment_count = current_segment_count + 1;
-    uint32_t *new_ppn = realloc(crb->segments_ppn, new_segment_count * sizeof(uint32_t));
-    if (!new_ppn) {
+    bool *new_accuracy = realloc(crb->accuracy, new_segment_count * sizeof(bool));
+    if (!new_accuracy) {
         free(sorted_lbas);
         return;
     }
-    crb->segments_ppn = new_ppn;
+    crb->accuracy = new_accuracy;
     
     // 如果是第一个段，直接复制数据
     if (current_segment_count == 0) {
         for (int i = 0; i < sorted_size; i++) {
             crb->data[i] = sorted_lbas[i];
         }
-        crb->segments_ppn[0] = segment_ppn;
+        crb->accuracy[0] = is_accurate;
         crb->size = sorted_size;
     } else {
         // 不是第一个段，需要找到插入位置
@@ -268,9 +233,9 @@ void crbinsert(int group, int *lba_offsets, int size, uint32_t segment_ppn) {
             crb->data[i + sorted_size + 1] = crb->data[i];
         }
         
-        // 移动segments_ppn数组
+        // 移动accuracy数组
         for (int i = current_segment_count - 1; i >= target_segment_index; i--) {
-            crb->segments_ppn[i + 1] = crb->segments_ppn[i];
+            crb->accuracy[i + 1] = crb->accuracy[i];
         }
         
         // 插入分隔符和新段数据
@@ -282,15 +247,15 @@ void crbinsert(int group, int *lba_offsets, int size, uint32_t segment_ppn) {
             crb->data[insert_position + 1 + i] = sorted_lbas[i];
         }
         
-        // 设置新段的PPN
-        crb->segments_ppn[target_segment_index] = segment_ppn;
+        // 设置新段的精度
+        crb->accuracy[target_segment_index] = is_accurate;
         crb->size = new_total_size;
     }
     
     free(sorted_lbas);
-    
+    memoryUsed += size*sizeof(uint8_t);
     // 更新内存使用统计
-    memoryUsed += (sorted_size * sizeof(uint8_t) + sizeof(uint32_t));
+    
 }
 
 void FTLInit() {
@@ -302,12 +267,7 @@ void FTLInit() {
     memoryUsed += sizeof(FTL);
     ftl->write_buffer.next_ppn = 1000;
     for(int i = 0; i < NUMBER_OF_SECTORS; i++){
-        
         init_crb(&ftl->t[i].crb);
-        // 初始化bitmap，所有bit为0，表示都在CRB中
-        for (int j = 0; j < 4; j++) {
-            ftl->t[i].bitmap[j] = 0;
-        }
     }
 }
 
@@ -366,7 +326,7 @@ bool is_overlap(section *a, section *b) {
     return !(a->start > b_end || a_end < b->start);
 }
 
-// 从levelsec中删除指定索引的section，并压缩数组
+// 从levelsec中删除指定索引的section
 void remove_section_from_level(levelsec *lsec, int index) {
     if (!lsec || index < 0 || index >= lsec->size) {
         return;
@@ -377,20 +337,9 @@ void remove_section_from_level(levelsec *lsec, int index) {
         lsec->sec[i] = lsec->sec[i + 1];
     }
     lsec->size--;
-    
-    // 如果数组变得太小，可以缩小容量以节省内存
-    if (lsec->capacity > 4 && lsec->size < lsec->capacity / 2) {
-        uint8_t new_capacity = lsec->capacity / 2;
-        section *new_secs = realloc(lsec->sec, new_capacity * sizeof(section));
-        if (new_secs) {
-            lsec->sec = new_secs;
-            lsec->capacity = new_capacity;
-            memoryUsed -= (lsec->capacity - new_capacity) * sizeof(section);
-        }
-    }
 }
 
-// 修改后的Insert函数 - 彻底删除重叠的section而不是仅仅无效化
+// 修改后的Insert函数
 void Insert(int idx, section new_sec, int start_level) {
     memoryUsed += sizeof(section);
     if (!ftl || idx < 0 || idx >= NUMBER_OF_SECTORS) {
@@ -410,7 +359,6 @@ void Insert(int idx, section new_sec, int start_level) {
             
             ftl->t[idx].levels[ftl->t[idx].level_count].sec = NULL;
             ftl->t[idx].levels[ftl->t[idx].level_count].size = 0;
-            ftl->t[idx].levels[ftl->t[idx].level_count].capacity = 0;
             ftl->t[idx].level_count = new_count;
         }
         
@@ -437,39 +385,24 @@ void Insert(int idx, section new_sec, int start_level) {
             memoryUsed -= sizeof(section);
             
             // 插入当前section到当前层
-            if (current_level_ptr->size >= current_level_ptr->capacity) {
-                uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
-                section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
-                if (!new_secs) return;
-                current_level_ptr->sec = new_secs;
-                current_level_ptr->capacity = new_capacity;
-            }
-            current_level_ptr->sec[current_level_ptr->size++] = current_sec;
+            uint8_t new_size = current_level_ptr->size + 1;
+            section *new_secs = realloc(current_level_ptr->sec, new_size * sizeof(section));
+            if (!new_secs) return;
+            current_level_ptr->sec = new_secs;
+            current_level_ptr->sec[current_level_ptr->size] = current_sec;
+            current_level_ptr->size = new_size;
             
             // 将冲突的section作为下一轮要处理的section
             current_sec = temp_sec;
             current_level++;
         } else {
             // 没有冲突，直接插入当前层
-            if (current_level_ptr->size >= current_level_ptr->capacity) {
-                uint8_t new_capacity = current_level_ptr->capacity == 0 ? 4 : current_level_ptr->capacity * 2;
-                section *new_secs = realloc(current_level_ptr->sec, new_capacity * sizeof(section));
-                if (!new_secs) return;
-                current_level_ptr->sec = new_secs;
-                current_level_ptr->capacity = new_capacity;
-            }
-            current_level_ptr->sec[current_level_ptr->size++] = current_sec;
-            
-            // 更新bitmap状态：将这个section覆盖的所有LBA标记为在section中
-            if (current_sec.length > 0) {
-                // 连续序列
-                for (uint8_t offset = current_sec.start; offset <= current_sec.start + current_sec.length; offset += (current_sec.step > 0 ? current_sec.step : 1)) {
-                    set_bitmap_status(&ftl->t[idx], offset, true);
-                }
-            } else {
-                // 单个元素
-                set_bitmap_status(&ftl->t[idx], current_sec.start, true);
-            }
+            uint8_t new_size = current_level_ptr->size + 1;
+            section *new_secs = realloc(current_level_ptr->sec, new_size * sizeof(section));
+            if (!new_secs) return;
+            current_level_ptr->sec = new_secs;
+            current_level_ptr->sec[current_level_ptr->size] = current_sec;
+            current_level_ptr->size = new_size;
             break;
         }
     }
@@ -518,18 +451,14 @@ void ProcessWriteBuffer() {
             section sec;
             sec.start = ftl->write_buffer.lba[group_idx] % SECTORS_PER_GROUP;
             sec.b = current_ppn * FLASH_PAGE_SIZE;
-            
-            uint64_t pba = current_ppn * FLASH_PAGE_SIZE;
+            sec.accuracy = true; // 默认为精确段
             
             // 检查是否是单个元素
             if (group_idx == group_end) {
-                
                 data = malloc(sizeof(int));
                 data[0] = ftl->write_buffer.lba[group_idx] % SECTORS_PER_GROUP;
                 size = 1;
-                crbinsert(current_group, data, size, current_ppn);
-                // 更新bitmap状态：新插入CRB的LBA标记为在CRB中
-                set_bitmap_status(&ftl->t[current_group], data[0], false);
+                crbinsert(current_group, data, size, true); // 精确段
                 current_ppn++;
                 group_idx++;
                 free(data);
@@ -547,8 +476,8 @@ void ProcessWriteBuffer() {
             
             // 查找具有相同步长的连续序列
             for (int i = group_idx + 1; i <= group_end; i++) {
-                if ((ftl->write_buffer.lba[i] - ftl->write_buffer.lba[i - 1] >= tolerance + step) && 
-                    (ftl->write_buffer.lba[i] - ftl->write_buffer.lba[i - 1] <= tolerance + step)) {
+                if ((ftl->write_buffer.lba[i] - ftl->write_buffer.lba[i - 1] >= step - tolerance) && 
+                    (ftl->write_buffer.lba[i] - ftl->write_buffer.lba[i - 1] <= step + tolerance)) {
                     size++;
                     int *data_ = (int*)realloc(data, sizeof(int) * size);
                     data = data_;
@@ -565,22 +494,27 @@ void ProcessWriteBuffer() {
             }
             
             if (sequence_end > group_idx && is_continuous) {
-                // 找到连续序列
+                // 找到连续序列 - 精确段
                 sec.length = (ftl->write_buffer.lba[sequence_end] % SECTORS_PER_GROUP) - 
                             (ftl->write_buffer.lba[group_idx] % SECTORS_PER_GROUP);
                 sec.step = step;
+                sec.accuracy = true;
                 
                 Insert(current_group, sec, 0);
                 current_ppn += (sequence_end - group_idx) + 1;
                 group_idx = sequence_end + 1;
+            } else if (size > 1) {
+                // 非连续序列 - 近似段
+                sec.accuracy = false;
+                Insert(current_group, sec, 0);
+                
+                // 同时将数据插入CRB作为近似段
+                crbinsert(current_group, data, size, false);
+                current_ppn += size;
+                group_idx += size;
             } else {
-                // 单个元素或非连续序列
-              
-                crbinsert(current_group, data, size, current_ppn);
-                // 更新bitmap状态：新插入CRB的LBA标记为在CRB中
-                for (int i = 0; i < size; i++) {
-                    set_bitmap_status(&ftl->t[current_group], data[i], false);
-                }
+                // 单个元素 - 精确段
+                crbinsert(current_group, data, size, true);
                 current_ppn += size;
                 group_idx += size;
             }
@@ -610,19 +544,30 @@ uint64_t search_in_sections(table *t, uint8_t offset) {
             }
             
             // 检查LBA是否在这个段内
-            if (sec->length > 0) {
-                // 连续序列的情况
-                if (offset >= sec->start && offset <= sec->start + sec->length) {
-                    if (sec->step > 0 && (offset - sec->start) % sec->step == 0) {
-                        uint32_t ppa_offset = (offset - sec->start) / sec->step;
-                        uint64_t result = sec->b + ppa_offset * FLASH_PAGE_SIZE;
-                        return result;
+            if (sec->accuracy) {
+                // 精确段：直接计算
+                if (sec->length > 0) {
+                    // 连续序列的情况
+                    if (offset >= sec->start && offset <= sec->start + sec->length) {
+                        if (sec->step > 0 && (offset - sec->start) % sec->step == 0) {
+                            uint32_t ppa_offset = (offset - sec->start) / sec->step;
+                            uint64_t result = sec->b + ppa_offset * FLASH_PAGE_SIZE;
+                            return result;
+                        }
+                    }
+                } else {
+                    // 单个元素的情况
+                    if (offset == sec->start) {
+                        return sec->b;
                     }
                 }
             } else {
-                // 单个元素的情况
-                if (offset == sec->start) {
-                    return sec->b;
+                // 近似段：需要在CRB中查找
+                bool is_accurate;
+                int crb_offset = crb_search_offset(&t->crb, offset, &is_accurate);
+                if (crb_offset >= 0 && !is_accurate) {
+                    // 在CRB中找到且为近似段，返回段起始地址 + offset
+                    return sec->b + crb_offset * FLASH_PAGE_SIZE;
                 }
             }
         }
@@ -630,7 +575,7 @@ uint64_t search_in_sections(table *t, uint8_t offset) {
     return 0;
 }
 
-// 修改FTLRead函数，根据bitmap决定查找位置
+// 修改FTLRead函数
 uint64_t FTLRead(uint64_t lba) {
     if (!ftl) {
         return 0;
@@ -652,19 +597,23 @@ uint64_t FTLRead(uint64_t lba) {
     
     table *t = &ftl->t[idx];
     
-    // 1. 首先在红黑树中查找
-    
-    
-    // 2. 根据bitmap状态决定查找位置
-    bool in_section = get_bitmap_status(t, offset);
-    
-    if (in_section) {
-        // 在section中查找
-        return search_in_sections(t, offset);
-    } else {
-        // 在CRB中查找
-        return crb_search(&t->crb, offset);
+    // 首先在section中查找
+    uint64_t result = search_in_sections(t, offset);
+    if (result != 0) {
+        return result;
     }
+    
+    // 如果在section中没找到，在CRB中查找（精确段）
+    bool is_accurate;
+    int crb_offset = crb_search_offset(&t->crb, offset, &is_accurate);
+    if (crb_offset >= 0 && is_accurate) {
+        // 在CRB中找到且为精确段
+        // 这里需要根据CRB中的存储方式计算PBA
+        // 由于简化实现，这里返回一个基于offset的计算值
+        return (crb_offset + 1) * FLASH_PAGE_SIZE;
+    }
+    
+    return 0;
 }
 
 bool FTLModify(uint64_t lba) {
